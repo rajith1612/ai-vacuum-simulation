@@ -1,0 +1,166 @@
+import numpy as np
+import cv2
+import random
+import time
+import tensorflow as tf
+
+# Load Models
+dust_model = tf.keras.models.load_model('dust_detection_cnn.h5')
+stair_model = tf.keras.models.load_model('stair_detection_cnn.h5')
+
+# Parameters
+MAP_SIZE = (10, 10)
+CELL_SIZE = 30
+SPEED = 80  # Movement speed (ms)
+
+# Preprocessing
+def preprocess_patch(patch):
+    patch = cv2.cvtColor(patch, cv2.COLOR_BGR2RGB)
+    patch = cv2.resize(patch, (64, 64))
+    patch = patch / 255.0
+    patch = np.expand_dims(patch, axis=0)
+    return patch
+
+def predict_dust_patch(patch):
+    img = preprocess_patch(patch)
+    pred = dust_model.predict(img, verbose=0)
+    return "Dusty" if np.argmax(pred) == 0 else "Clean"
+
+def predict_stair_patch(patch):
+    img = preprocess_patch(patch)
+    pred = stair_model.predict(img, verbose=0)
+    classes = ["Obstacle", "Plain Floor", "Stair", "Unknown"]
+    return classes[np.argmax(pred)]
+
+# Create Floor
+def create_virtual_floor_realistic():
+    floor = np.zeros((MAP_SIZE[0], MAP_SIZE[1], 3), dtype=np.uint8)
+    floor_type = random.choice(["wood", "marble"])
+    color = (255, 220, 200) if floor_type == "wood" else (230, 230, 230)
+    for i in range(MAP_SIZE[0]):
+        for j in range(MAP_SIZE[1]):
+            floor[i, j] = color
+    # Add stairs at bottom-right
+    floor[MAP_SIZE[0]-2:MAP_SIZE[0], MAP_SIZE[1]-2:MAP_SIZE[1]] = (0, 255, 255)
+    return floor
+
+# Add Dust
+def add_dust(floor_map):
+    for i in range(MAP_SIZE[0]):
+        for j in range(MAP_SIZE[1]):
+            if random.random() < 0.15:
+                floor_map[i, j] = (0, 0, 255)  # Red for Dust
+    return floor_map
+
+# Draw Map
+def draw_whole_map(floor, vacuum_pos):
+    img = np.zeros((MAP_SIZE[0]*CELL_SIZE, MAP_SIZE[1]*CELL_SIZE, 3), dtype=np.uint8)
+    for i in range(MAP_SIZE[0]):
+        for j in range(MAP_SIZE[1]):
+            cell = floor[i, j]
+            img[i*CELL_SIZE:(i+1)*CELL_SIZE, j*CELL_SIZE:(j+1)*CELL_SIZE] = cell
+    x, y = vacuum_pos
+    cv2.circle(img, (y*CELL_SIZE + CELL_SIZE//2, x*CELL_SIZE + CELL_SIZE//2), CELL_SIZE//3, (0, 255, 0), -1)
+    return img
+
+# Movement - Smarter with Memory
+def move_vacuum_smart(floor, pos, memory):
+    x, y = pos
+    candidates = []
+    directions = [(-1,0), (1,0), (0,-1), (0,1)]
+    for dx, dy in directions:
+        new_x = x + dx
+        new_y = y + dy
+        if 0 <= new_x < MAP_SIZE[0] and 0 <= new_y < MAP_SIZE[1]:
+            candidates.append((new_x, new_y))
+
+    # Prefer unvisited neighbors
+    unvisited = [c for c in candidates if c not in memory]
+    if unvisited:
+        return random.choice(unvisited)
+    return random.choice(candidates) if candidates else pos
+
+# Simulate Stair Climb
+def simulate_stair_climb():
+    for step in range(10):
+        stair_img = np.zeros((300, 300, 3), dtype=np.uint8)
+        cv2.putText(stair_img, f"Climbing Step {step+1}...", (40, 150),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+        cv2.imshow("AI Vacuum Simulation", stair_img)
+        cv2.waitKey(300)
+    cv2.destroyWindow("AI Vacuum Simulation")
+
+# Run Full Simulation
+def run_simulation():
+    floor_number = 1
+
+    while True:
+        print(f"🏠 Starting Floor {floor_number}")
+        floor_map = create_virtual_floor_realistic()
+        floor_map = add_dust(floor_map)
+        vacuum_pos = (0, 0)
+        step = 0
+        cleaned_tiles = 0
+        visited_memory = set()
+
+        cv2.namedWindow("AI Vacuum Simulation", cv2.WINDOW_NORMAL)
+
+        while True:
+            img = draw_whole_map(floor_map, vacuum_pos)
+            cv2.imshow("AI Vacuum Simulation", img)
+            key = cv2.waitKey(SPEED)
+            if key == 27:
+                print("🚪 Exiting Simulation")
+                cv2.destroyAllWindows()
+                return
+
+            x, y = vacuum_pos
+            patch = floor_map[x, y]
+
+            # Predict Dust
+            dust_status = predict_dust_patch(patch)
+
+            # Clean if Dust
+            if (patch == np.array([0, 0, 255])).all():
+                print(f"[Step {step}] 🧹 Cleaning dust at {vacuum_pos}")
+                floor_map[x, y] = (255, 255, 255)
+                cleaned_tiles += 1
+            else:
+                print(f"[Step {step}] - Dust Status: {dust_status} at {vacuum_pos}")
+
+            visited_memory.add(vacuum_pos)
+
+            # Check if floor is clean
+            dust_left = any((floor_map[i, j] == np.array([0,0,255])).all()
+                            for i in range(MAP_SIZE[0]) for j in range(MAP_SIZE[1]))
+
+            # If no dust left and we're in stair zone
+            if not dust_left and x >= MAP_SIZE[0]-2 and y >= MAP_SIZE[1]-2:
+                stair_status = predict_stair_patch(patch)
+                if stair_status == "Stair":
+                    print("🛗 Detected stairs! Climbing...")
+                    simulate_stair_climb()
+                    floor_number += 1
+                    break  # Move to next floor
+
+            # Movement Logic
+            if dust_left:
+                vacuum_pos = move_vacuum_smart(floor_map, vacuum_pos, visited_memory)
+            else:
+                # Move toward bottom-right stair
+                sx, sy = vacuum_pos
+                tx, ty = MAP_SIZE[0]-1, MAP_SIZE[1]-1
+                if sx < tx:
+                    sx += 1
+                elif sx > tx:
+                    sx -= 1
+                elif sy < ty:
+                    sy += 1
+                elif sy > ty:
+                    sy -= 1
+                vacuum_pos = (sx, sy)
+
+            step += 1
+
+# Start Simulation
+run_simulation()
